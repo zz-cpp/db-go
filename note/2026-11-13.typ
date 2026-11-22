@@ -1214,3 +1214,265 @@ Go 也不提供「这次赋值是否改变了值」的原子检查；
 + 补 history 三条；
 + nil / 空键子域：补断言或标 `TODO(阶段末)`；
 + 修 `exisit` 与开头空 `*` 行。
+
+= 0102 TDD：Entry.Encode / Entry.Decode
+
+// 轨道：CS 轨
+
+== 费曼直觉
+
+TDD 不是「先写测试再写实现」的口号，而是*用测试把契约钉死，再让实现去满足*。
+它把「我觉得应该这样」变成「跑一下就知道是不是这样」。
+
+0102 的契约非常小，正适合练 TDD：
+
+#codelisting(
+  "| key size | val size | key data | val data |\n| 4 bytes  | 4 bytes  |   ...    |   ...    |\n\nlength = little-endian uint32",
+  lang: "text",
+  caption: [0102 的编码格式：8 字节头 + 两段变长数据],
+)
+
+作者测试只有一条逐字节断言（`kv_test.go` 的 `TestEntryEncode`）：
+`key = k1`、`val = xxx` 时，编码结果是 `2,0,0,0, 3,0,0,0, k,1, x,x,x`。
+注意它*没有* `deleted` 字节——文档里提到的第 9 字节属于 0103。
+
+#importantbox[
+  TDD 的「红」不是「编译失败」。编译失败只说明代码不完整，
+  不能告诉你行为对不对。先补最小桩让测试跑起来，看到*断言*红，才算进入 TDD 循环。
+]
+
+== 硬核机制
+
+=== 当前红基线
+
+#codelisting(
+  "$ go test ./internal/db/ -run TestKVBasic -count=1\ninternal/db/kv_entry.go:12:6: missing function body\ninternal/db/kv_entry.go:14:6: missing function body\nFAIL  github.com/zz-cpp/db-go/internal/db [build failed]",
+  lang: "text",
+  caption: [0102 骨架未实现：这是编译红，不是断言红],
+)
+
+=== TDD 的五个循环（对应 skill 七动作）
+
+#booktabs-table(
+  columns: (auto, 1.5fr, 2.4fr, 1.8fr),
+  [*循环*], [*动作*], [*你写什么*], [*期望看到*],
+  [1], [写编码测试], [逐字节断言 + 往返断言], [编译红 → 补桩 → 断言红],
+  [2], [实现 `Encode`], [最小可用实现], [编码与往返测试变绿],
+  [3], [写解码错误测试], [空 reader、短头、短数据], [断言红（可能 panic）],
+  [4], [实现 `Decode` 的错误处理], [`io.ReadFull` + 错误返回], [错误测试变绿],
+  [5], [写边界测试], [空 key、空 val、分块读], [红 → 绿 → 重构],
+)
+
+每个循环只写*一个*失败测试，然后只做让它通过的最小改动。
+不要一次写完五个测试再一起实现——那样失败时不知道是哪条契约没满足。
+
+=== 测试意图清单（你来写，不给代码）
+
+#booktabs-table(
+  columns: (1.4fr, 1.6fr, 2fr, 1.6fr),
+  [*用例*], [*输入*], [*期望*], [*覆盖的契约*],
+  [逐字节编码], [key=k1, val=xxx], [8 字节头 + 数据], [格式与端序],
+  [往返], [任意非空 key/val], [Decode 后字段相等], [Encode/Decode 对称],
+  [空 key], [key 长度 0, val 非空], [头为 0 + 数据], [边界],
+  [空 val], [key 非空, val 长度 0], [头为 0], [边界],
+  [短头], [reader 只有 3 字节], [返回 error，不 panic], [错误处理],
+  [短数据], [头声明 5 字节，实际 3 字节], [返回 error], [错误处理],
+  [分块读], [每次只给 1 字节的 reader], [仍能正确解码], [`io.ReadFull`],
+  [别名], [编码后修改 `ent.key`], [已编码字节不变], [出向安全],
+)
+
+这张表是*测试意图*，不是测试代码。每条用一个命名子测试表达（`t.Run`），
+失败时能直接看到是哪条契约破了。
+
+=== 提示阶梯（先看第 1 条，卡住再看下一条）
+
+*第 1 级（强）*：
+
++ 长度用 `encoding/binary` 的 `binary.LittleEndian.PutUint32` / `Uint32`；
++ 读固定长度用 `io.ReadFull`，不要用一次 `r.Read`；
++ 头是 8 字节：前 4 字节 key 长度，后 4 字节 val 长度。
+
+*第 2 级（中）*：
+
++ `Encode` 可以先 `make` 一个 `8 + len(key) + len(val)` 的切片，再按偏移填；
+  也可以用 `append` 分步拼；
++ `Decode` 先读 8 字节头，再按两个长度各读一段；
++ 空 key / 空 val 的长度是 0，读取时 `make([]byte, 0)` 是合法的。
+
+*第 3 级（弱）*：
+
++ 短读可以返回 `io.ErrUnexpectedEOF` 或包装它；
++ `Decode` 失败时最好保持 `ent` 原状（先读临时变量，成功后再赋值）；
++ 长度超过 `math.MaxUint32` 属于前置条件，可以先不处理，但要在规格里写。
+
+=== 五个判别题
+
++ *为什么用 `io.ReadFull` 而不是 `r.Read`？*
+  `Read` 允许返回 `n < len(p)` 且 `err == nil`；网络和文件都可能短读，
+  只读一次会得到不完整的数据。
++ *为什么长度用 `uint32` 而不是 `int`？*
+  文件格式需要固定宽度；`int` 在不同平台宽度不同（32/64 位），
+  写进文件会产生不可移植的格式。
++ *`Encode` 返回的切片和 `ent.key` 共享内存吗？*
+  如果直接 `append(ent.key, ...)`，可能复用底层数组；
+  客户修改返回值会写坏 `ent`。要返回新分配的切片。
++ *`Decode` 失败时 `ent` 应该保持原状吗？*
+  这是失败语义：推荐「不变」（原子），否则客户拿到一个半成品对象。
++ *空 key 合法吗？*
+  `Entry` 的结构没有禁止；除非规格显式拒绝，否则空 key 是合法的。
+
+=== skill 七动作对照
+
+#booktabs-table(
+  columns: (1fr, 1.8fr, 2fr),
+  [*动作*], [*0102 的落点*], [*验收*],
+  [读], [读 0102 文档与作者测试], [能说出格式、端序、为什么长度前缀],
+  [规格], [写 `Encode` / `Decode` 的 doc comment], [格式、错误、边界都有说法],
+  [测试], [先写逐字节 + 往返测试], [看到断言红],
+  [实现], [只满足当前测试], [一条测试变绿，不提前写 0103],
+  [验证], [`go test` / `go vet` / `go build`], [输出贴进笔记],
+  [落盘], [note 记录红绿过程], [可复查],
+  [进度], [0102 状态从 🟨 变 🟩], [指向 0103],
+)
+
+=== 验收与变异检查
+
+#codelisting(
+  "$ go test ./internal/db/ -run TestEntry -v -count=1\n$ go test ./internal/db/ -count=1\n$ go vet ./...",
+  lang: "bash",
+  caption: [0102 的常规验收命令],
+)
+
+光绿还不够，做两次变异检查证明测试有效：
+
+#booktabs-table(
+  columns: (1.8fr, 1.6fr, 1.8fr),
+  [*变异*], [*应该发生什么*], [*说明*],
+  [把 LittleEndian 改成 BigEndian], [逐字节测试变红], [证明端序被锁定],
+  [把 `io.ReadFull` 改成一次 `Read`], [分块读测试变红], [证明短读被覆盖],
+  [忽略 Decode 的读取错误], [短读测试变红], [证明错误处理被覆盖],
+)
+
+== 陷阱与易错
+
+#warningbox[
+  *编译红不是 TDD 的红。* 补一个最小桩（返回 nil / 返回 nil error）让测试能跑，
+  再看到断言失败，才是真正的「红」。
+]
+
+#warningbox[
+  *一次写五个测试再实现。* 失败时无法归因。一个循环只加一个失败测试。
+]
+
+#warningbox[
+  *用 `r.Read` 读头。* 它可能只读 3 个字节就返回；必须 `io.ReadFull`。
+]
+
+#warningbox[
+  *`append` 复用底层数组。* `append(ent.key, ...)` 可能和 `ent.key` 共享内存；
+  编码结果应该是独立的新切片。
+]
+
+#warningbox[
+  *忘记空 key / 空 val。* 长度 0 是合法输入，不要用 `len > 0` 当隐含前置条件。
+]
+
+== 关键点
+
+#importantbox[
+  0102 的 TDD 从「逐字节编码」这一条测试开始：
+  先补桩让它能跑，看到断言红，再实现 `Encode`；然后写往返测试、错误测试、边界测试。
+  每条测试只对应一个契约，绿了再进入下一个循环。
+]
+
+#booktabs-table(
+  columns: (1.2fr, 2fr, 2fr),
+  [*阶段*], [*测试*], [*实现*],
+  [红 1], [逐字节编码], [补桩],
+  [绿 1], [同上], [`Encode`],
+  [红 2], [往返], [`Decode` 未实现],
+  [绿 2], [同上], [`Decode` 正常路径],
+  [红 3], [短读 / 分块读], [错误处理缺失],
+  [绿 3], [同上], [`io.ReadFull` + 错误返回],
+  [重构], [全部保持绿], [提取辅助函数、清理重复],
+)
+
+== 变式检验
+
+*变式 1：如果格式改成大端，测试怎么变？*
+逐字节断言里的 `2,0,0,0` 会变成 `0,0,0,2`；其余逻辑不变。
+这正是「端序是格式的一部分」——测试锁定它，实现不能随便改。
+
+*变式 2：如果 `Decode` 要从一个 `[]byte` 里解出多条记录，怎么办？*
+需要返回「已消费的字节数」或使用 `bytes.Reader`；
+当前签名 `Decode(io.Reader)` 只消费一条记录，剩余数据留在 reader 里。
+
+*变式 3：如果长度用 varint，哪些测试会变？*
+逐字节断言全变；往返测试不变。这说明「格式测试」和「行为测试」是两层。
+
+*变式 4：空 key 和空 val 的编码结果一样吗？*
+不一样：头里两个长度字段的位置不同，`key 空、val 非空` 与 `key 非空、val 空`
+的字节序列不同。要分别测。
+
+*变式 5：`Decode` 失败后，reader 的位置在哪里？*
+`io.ReadFull` 会消费掉已读的字节；合同应说明「失败后 reader 位置未定义」，
+或者要求调用方丢弃这个 reader。
+
+== 同类归类
+
+#booktabs-table(
+  columns: (1.3fr, 1.8fr, 2fr),
+  [*概念*], [*0102 的落点*], [*后续步骤*],
+  [长度前缀], [8 字节头], [0201 加类型 tag],
+  [端序], [little-endian uint32], [0601 SSTable 格式],
+  [错误处理], [短读返回 error], [0105 torn write],
+  [别名], [Encode 返回新切片], [0201 `slices.Clone`],
+  [TDD], [红-绿-重构], [每一步都重复],
+)
+
+== Go 语言机制补充
+
+*`encoding/binary`。* `binary.LittleEndian.PutUint32(b, v)` 把 `v` 写进 `b` 的前 4 字节；
+`binary.LittleEndian.Uint32(b)` 读回来。长度字段用定宽整数，不依赖 `int` 的平台宽度。
+
+*`io.ReadFull` 的语义。* 它读满 `len(p)` 字节或返回错误；
+返回 `io.EOF` 表示一个字节都没读到，`io.ErrUnexpectedEOF` 表示读了一部分。
+这正是解析固定长度头需要的语义。
+
+*`io.Reader` 的短读。* `Read` 允许返回 `n < len(p)` 且 `err == nil`；
+任何「读固定长度」的代码都必须循环或使用 `io.ReadFull`。
+
+*`append` 的别名。* `append` 在容量足够时复用底层数组；
+要让返回值与 `ent.key` 独立，应该新分配切片再拷贝。
+
+*测试文件命名。* `kv_entry.go` 对应 `kv_entry_test.go`；
+同包测试可以直接构造 `Entry{key: ..., val: ...}`（字段未导出也没关系）。
+
+*6.031 对照。* 本题对应 R06 规格（编码格式与错误）、R08 不可变（返回新切片）、
+R04 测试（逐字节 + 往返 + 边界）。6.102 的 D01 讲数据编码与长度前缀。
+
+== 本次操作与当前状态
+
+*已做的文件操作*：
+
++ 读取 `internal/db/kv_entry.go` 的骨架（`Entry`、`Encode`、`Decode` 均无实现）；
++ 读取 `db-go-problems.md` 的 0102 条目与 `ch01-storage-basics.md` 的 0102 任务块；
++ 读取作者参考测试 `db_project/0102/kv_test.go` 的 `TestEntryEncode` 断言；
++ 运行 `go test ./internal/db/ -run TestKVBasic -count=1` 记录编译红；
++ 追加本一级标题到 `note/2026-11-13.typ`；
++ 未修改 `internal/db` 下任何代码或测试文件。
+
+*验证结果*：
+
++ `go test ./internal/db/ -run TestKVBasic -count=1` → `FAIL [build failed]`，
+  `kv_entry.go:12:6` 与 `14:6` 报 `missing function body`；
++ 作者测试的期望字节：`2,0,0,0, 3,0,0,0, k,1, x,x,x`（无 `deleted` 字节）；
++ `typst compile 2026-11-13.typ` → 待编译确认（见下）。
+
+*需要你自己动手的*：
+
++ 先建 `internal/db/kv_entry_test.go`（或沿用 `kv_test.go`，二选一）；
++ 写第一条测试：逐字节编码，覆盖 `key=k1`、`val=xxx`；
++ 补最小桩让测试跑起来，确认断言红；
++ 按五个循环依次推进，每绿一条再写下一条；
++ 最后跑常规验收 + 两次变异检查。

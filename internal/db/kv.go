@@ -5,6 +5,11 @@ import (
 	"errors"
 )
 
+var (
+	ErrKeyIsNil   = errors.New("key is nil")
+	ErrKeyIsEmpty = errors.New("key is empty")
+)
+
 // KV is a mutable in-memory key-value store.
 //
 //	Abstraction function:
@@ -17,46 +22,57 @@ import (
 //		len( each of mem.keys) >= 1
 //		len( each of mem.values) >= 1
 //
-// TODO(user): rewrite the two lines above as decidable predicates; decide
-// whether empty keys and values are legal; add mem != nil or an Open
-// precondition if the zero value is not usable.
 //
 //	Safety from rep exposure:
 //			mem is private
 //			mem.val is mutable, So Get() and Set() make defensive copies to avoid sharing the rep's values in mem with clients
-//
-// TODO(user): separate inbound and outbound copying; explain why key needs no
-// copy; state what Get returns when the key is absent.
 type KV struct {
+	log Log
 	mem map[string][]byte
 }
 
-var ErrKeyIsNil = errors.New("key is nil")
-
-// ErrNotFound      = errors.New("key not found")
-// ErrUpdatedFailed = errors.New("updated val not found")
-
-// func (kv *KV) checkRI() {
-// 	// TODO(user): implement the RI checks, or remove this function if the
-// 	// invariant is maintained by construction.
-// }
-
-// Open initializes the KV store.
+// Open initializes the in-memory KV store.
 //
-// TODO(user): state whether KV must be opened before use.
-// TODO(user): state the effect of calling Open more than once.
-// TODO(user): state when Open returns a non-nil error.
+// require: kv must be non-nil. A zero-value KV is valid.
+//
+// effects: Open clears any existing entries, using log file to recover  data.
 func (kv *KV) Open() error {
+	var err error
 	kv.mem = map[string][]byte{} // empty
-	return nil
+	if err = kv.log.Open(); err != nil {
+		return err
+	}
+
+	ent := Entry{}
+	// debug
+	replayed := 0
+
+	// replay according to the WAL log file.
+	for {
+		eof, err := kv.log.Read(&ent)
+		if err != nil {
+			return err
+		}
+
+		if eof {
+			break
+		}
+
+		if !ent.deleted {
+			kv.mem[string(ent.key)] = ent.val
+		} else {
+			delete(kv.mem, string(ent.key))
+		}
+
+		replayed++
+
+	}
+
+	return err
 }
 
 // Close closes the KV store.
-//
-// TODO(user): state whether the store remains usable after Close.
-// TODO(user): state whether Close is idempotent.
-// TODO(user): state when Close returns a non-nil error.
-func (kv *KV) Close() error { return nil }
+func (kv *KV) Close() error { return kv.log.Close() }
 
 // Get returns the new value associated with key.
 //
@@ -94,7 +110,7 @@ func (kv *KV) Get(key []byte) (val []byte, ok bool, err error) {
 	return
 }
 
-// Set stores val under key.
+// Set stores val under key. If the key is already in store, it will modify the val. the args will not be modified.
 //
 // Parameters:
 //
@@ -107,33 +123,39 @@ func (kv *KV) Get(key []byte) (val []byte, ok bool, err error) {
 //
 // Postconditions:
 //
-// the key and val will be a stored unique pair.
-//
-// If len(key)>=1:
+// If len(key)>=1
 //
 //   - updated is true.
 //   - err is nil.
 //
+//
 // If len(key) is 0, but != nil:
 //
 //   - updated is false.
-//   - err is nil.
+//   - err is obj represents the key length is 0.
 //
 // If key == nil:
 //
 //   - updated is false.
 //   - err is obj represents the key is nil.
+
 func (kv *KV) Set(key []byte, val []byte) (updated bool, err error) {
 	if key == nil {
 		return false, ErrKeyIsNil
 	} else if len(key) == 0 {
-		return false, nil
+		return false, ErrKeyIsEmpty
+	}
+
+	ent := Entry{key, val, false}
+
+	if err = kv.log.Write(&ent); err != nil {
+		panic("log write failed")
+		// return false, err
 	}
 
 	kv.mem[string(key)] = bytes.Clone(val)
-	newVal, _ := kv.mem[string(key)]
-	updated = bytes.Equal(val, newVal)
-	return
+
+	return true, err
 }
 
 // Del removes key.
@@ -173,7 +195,14 @@ func (kv *KV) Del(key []byte) (deleted bool, err error) {
 	_, deleted = kv.mem[string(key)]
 
 	if deleted {
+		ent := Entry{key, nil, true}
+
+		if err = kv.log.Write(&ent); err != nil {
+			panic("log write failed")
+		}
+
 		delete(kv.mem, string(key))
+
 	}
 	return
 }

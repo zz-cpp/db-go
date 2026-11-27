@@ -10,10 +10,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestEntryEncode checks the 0102 record format in both directions.
+// TestEntryEncode checks the 0103 set and deletion formats in both directions.
 func TestEntryEncode(t *testing.T) {
 	ent := Entry{key: []byte("k1"), val: []byte("xxx")}
-	data := []byte{2, 0, 0, 0, 3, 0, 0, 0, 'k', '1', 'x', 'x', 'x'}
+	data := []byte{2, 0, 0, 0, 3, 0, 0, 0, 0, 'k', '1', 'x', 'x', 'x'}
 
 	assert.Equal(t, data, ent.Encode())
 
@@ -21,11 +21,21 @@ func TestEntryEncode(t *testing.T) {
 	err := decoded.Decode(bytes.NewBuffer(data))
 	assert.Nil(t, err)
 	assert.Equal(t, ent, decoded)
+
+	ent = Entry{key: []byte("k1"), deleted: true}
+	data = []byte{2, 0, 0, 0, 0, 0, 0, 0, 1, 'k', '1'}
+
+	assert.Equal(t, data, ent.Encode())
+
+	decoded = Entry{}
+	err = decoded.Decode(bytes.NewBuffer(data))
+	assert.Nil(t, err)
+	assert.Equal(t, ent, decoded)
 }
 
 // QzBQWVJJOUhU https://trialofcode.org/
 
-// TestEntryRecordFormat checks Encode and Decode against independent fixtures.
+// TestEntryRecordFormat checks 0103 set records against independent fixtures.
 func TestEntryRecordFormat(t *testing.T) {
 	// Testing strategy
 	//
@@ -46,51 +56,51 @@ func TestEntryRecordFormat(t *testing.T) {
 		name       string
 		key        []byte
 		value      []byte
-		wantHeader [8]byte
+		wantHeader [9]byte
 	}{
 		{
 			name:       "covers empty key and empty value",
-			wantHeader: [8]byte{},
+			wantHeader: [9]byte{},
 		},
 		{
 			name:       "covers empty key and nonempty value",
 			value:      []byte("v"),
-			wantHeader: [8]byte{0, 0, 0, 0, 1, 0, 0, 0},
+			wantHeader: [9]byte{0, 0, 0, 0, 1, 0, 0, 0, 0},
 		},
 		{
 			name:       "covers nonempty key and empty value",
 			key:        []byte("k"),
-			wantHeader: [8]byte{1, 0, 0, 0, 0, 0, 0, 0},
+			wantHeader: [9]byte{1, 0, 0, 0, 0, 0, 0, 0, 0},
 		},
 		{
 			name:       "covers nonempty key shorter than value",
 			key:        []byte{0x00, 0xff},
 			value:      []byte("val"),
-			wantHeader: [8]byte{2, 0, 0, 0, 3, 0, 0, 0},
+			wantHeader: [9]byte{2, 0, 0, 0, 3, 0, 0, 0, 0},
 		},
 		{
 			name:       "covers equal nonempty lengths",
 			key:        []byte("k"),
 			value:      []byte("v"),
-			wantHeader: [8]byte{1, 0, 0, 0, 1, 0, 0, 0},
+			wantHeader: [9]byte{1, 0, 0, 0, 1, 0, 0, 0, 0},
 		},
 		{
 			name:       "covers key longer than nonempty value",
 			key:        []byte("key"),
 			value:      []byte("v"),
-			wantHeader: [8]byte{3, 0, 0, 0, 1, 0, 0, 0},
+			wantHeader: [9]byte{3, 0, 0, 0, 1, 0, 0, 0, 0},
 		},
 		{
 			name:       "covers key length 255 and value length 256",
 			key:        bytes.Repeat([]byte{'k'}, 255),
 			value:      bytes.Repeat([]byte{'v'}, 256),
-			wantHeader: [8]byte{0xff, 0, 0, 0, 0, 1, 0, 0},
+			wantHeader: [9]byte{0xff, 0, 0, 0, 0, 1, 0, 0, 0},
 		},
 		{
 			name:       "covers key length 256 and value length 255",
 			key:        bytes.Repeat([]byte{'k'}, 256),
 			value:      bytes.Repeat([]byte{'v'}, 255),
-			wantHeader: [8]byte{0, 1, 0, 0, 0xff, 0, 0, 0},
+			wantHeader: [9]byte{0, 1, 0, 0, 0xff, 0, 0, 0, 0},
 		},
 	}
 
@@ -114,8 +124,12 @@ func TestEntryRecordFormat(t *testing.T) {
 }
 
 // TestEntryDecodeShortReads covers a complete record delivered one byte at a time.
+//
+// io.Reader may return fewer bytes than requested with no error. Force a short
+// read for the header, key, and value to catch decoders that assume one Read
+// fills each field. The entire record is still available to subsequent reads.
 func TestEntryDecodeShortReads(t *testing.T) {
-	wire := []byte{2, 0, 0, 0, 2, 0, 0, 0, 'k', '1', 'v', '2'}
+	wire := []byte{2, 0, 0, 0, 2, 0, 0, 0, 0, 'k', '1', 'v', '2'}
 	reader := iotest.OneByteReader(bytes.NewReader(wire))
 
 	var ent Entry
@@ -125,13 +139,17 @@ func TestEntryDecodeShortReads(t *testing.T) {
 }
 
 // TestEntryEncodeIndependentBytes checks that editing the result preserves the entry.
+//
+// Encode promises fresh storage. Edit the payload bytes, where sharing with the
+// entry's key or value would be observable, then check the entry by encoding it
+// again. The expected bytes come from a separate, fixed slice.
 func TestEntryEncodeIndependentBytes(t *testing.T) {
 	ent := Entry{key: []byte("k"), val: []byte("v")}
-	want := []byte{1, 0, 0, 0, 1, 0, 0, 0, 'k', 'v'}
+	want := []byte{1, 0, 0, 0, 1, 0, 0, 0, 0, 'k', 'v'}
 
 	encoded := ent.Encode()
 	require.Equal(t, want, encoded)
-	encoded[8], encoded[9] = 'K', 'V'
+	encoded[9], encoded[10] = 'K', 'V'
 
 	assert.Equal(t, want, ent.Encode())
 }
